@@ -34,7 +34,7 @@ volatile int16_t counter = 50;
 volatile bool fan_on = true;
 volatile uint32_t pulse_count = 0;
 
-/* System Heartbeat (Timer 0) */
+/* System Heartbeat (Timer 0) - Using CTC for 1ms ticks */
 ISR(TIMER0_COMPA_vect) {
     ms_ticks++;
 }
@@ -98,33 +98,48 @@ void lcd_init(void) {
 
 /* Fan Control Logic */
 void fan_init(void) {
-    DDRD |= (1 << PD5);      // PWM Output
-    DDRD &= ~(1 << PD3);     // TACH Input
-    PORTD |= (1 << PD3);    // Internal Pull-up for TACH
+    // Set PD5 as output
+    DDRD |= (1 << PD5);      
+    // Set PD3 as input with pull-up
+    DDRD &= ~(1 << PD3);     
+    PORTD |= (1 << PD3);    
 
-    // Timer 2: Fast PWM on OC2B (PD5), non-inverting
+    // Timer 2: Fast PWM on OC2B (PD5), non-inverting mode
     TCCR2A = (1 << COM2B1) | (1 << WGM21) | (1 << WGM20);
-    // Prescaler 64: Frequency ~976 Hz (Acceptable range 30Hz-300kHz)
+    
+    // Initial hardware speed sync
+    if (fan_on) {
+        OCR2B = (uint8_t)((counter * 255) / 100);
+    } else {
+        OCR2B = 0;
+    }
+
+    // Start Timer 2 clock with prescaler 64 (~976 Hz)
     TCCR2B = (1 << CS22); 
-    OCR2B = 0;
 }
 
 void update_fan_hardware(void) {
     if (!fan_on) {
         OCR2B = 0;
     } else {
+        // Enforce bounds
         if (counter > 100) counter = 100;
         if (counter < 0)   counter = 0;
         
-        // Linear mapping to 8-bit range
-        // If counter is 0, explicitly set 0. 
-        if (counter == 0) OCR2B = 0;
-        else OCR2B = (uint8_t)((counter * 255) / 100);
+        // Calculate 8-bit duty cycle (0-255)
+        if (counter == 0) {
+            OCR2B = 0;
+        } else {
+            // Lab 4 Slide 8: Start duty cycle should be >= 25% for reliability
+            // We scale the counter to the full 0-255 range
+            uint16_t temp_ocr = (uint16_t)((counter * 255UL) / 100UL);
+            OCR2B = (uint8_t)temp_ocr;
+        }
     }
 }
 
 /* Interrupt Service Routines */
-ISR(INT0_vect) { // Power Button
+ISR(INT0_vect) { // Power Button Toggle
     static uint32_t last_press = 0;
     uint32_t now = millis();
     if (now - last_press > BTN_DEBOUNCE_MS) {
@@ -137,11 +152,13 @@ ISR(INT1_vect) { // Tachometer Pulses
     pulse_count++;
 }
 
-ISR(PCINT0_vect) { // RPG
+ISR(PCINT0_vect) { // RPG Rotation
     static uint8_t last_state = 0;
     uint8_t curr_state = (PINB & 0x03); 
+    
+    // Only adjust speed if fan is currently toggled ON
     if (fan_on && (curr_state != last_state)) {
-        if (curr_state == 0x00) { // On detent
+        if (curr_state == 0x00) { // Stable detent
             if (last_state == 0x02)      counter++;
             else if (last_state == 0x01) counter--;
         }
@@ -150,43 +167,48 @@ ISR(PCINT0_vect) { // RPG
 }
 
 int main(void) {
-    // Timer 0 for millis()
-    TCCR0A = (1 << WGM01); 
-    OCR0A  = 249;          
+    // 1. Initialize System Timer (Timer 0) for millis()
+    TCCR0A = (1 << WGM01); // CTC Mode
+    OCR0A  = 249;          // 1ms @ 16MHz/64
     TCCR0B = (1 << CS01) | (1 << CS00); 
     TIMSK0 = (1 << OCIE0A);
 
+    // 2. Initialize Hardware Peripherals
     lcd_init();
     fan_init();
 
-    // INT0 (Button) and INT1 (Tach)
+    // 3. Configure External Interrupts
+    // INT0: Button (PD2), INT1: Tachometer (PD3)
     EICRA |= (1 << ISC01) | (1 << ISC11); // Falling edges
     EIMSK |= (1 << INT0) | (1 << INT1);
     
-    // PCINT (RPG)
-    PCICR  |= (1 << PCIE0);
-    PCMSK0 |= (1 << PCINT0) | (1 << PCINT1);
+    // 4. Configure Pin Change Interrupts (RPG)
+    PCICR  |= (1 << PCIE0); // Group 0
+    PCMSK0 |= (1 << PCINT0) | (1 << PCINT1); // PB0, PB1
     
+    // 5. Enable Global Interrupts
     sei();
     
     char buffer[16];
     
     while (1) {
+        // Ensure hardware reflects software state
         update_fan_hardware();
         
-        lcd_command(0x80); 
+        // Refresh LCD UI
+        lcd_command(0x80); // Line 1
         sprintf(buffer, "DC=%d.0%%   ", counter);
         lcd_print(buffer);
         
-        lcd_command(0xC0);
+        lcd_command(0xC0); // Line 2
         if (!fan_on) {
             lcd_print("Fan:OFF    ");
         } else {
-            // Note: Lab 4 Slide 8 mentions min start duty is 25%.
+            // Lab 4 Slide 8: Visual feedback for low power
             if (counter < 25) lcd_print("Fan:LOW    ");
             else             lcd_print("Fan:ON     ");
         }
         
-        _delay_ms(50);
+        _delay_ms(50); // Refresh rate
     }
 }
