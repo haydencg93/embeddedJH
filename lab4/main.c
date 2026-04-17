@@ -21,6 +21,12 @@ RPG:
 A -> ~9
 B -> 8
 
+FAN:
+Power -> VIN
+GND -> GND
+PWM -> ~5
+TACH -> ~3
+
 /* ================= DEBOUNCE ================= */
 
 #define BTN_DEBOUNCE_MS 40
