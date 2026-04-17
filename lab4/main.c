@@ -34,8 +34,8 @@ volatile int16_t counter = 50;
 volatile bool fan_on = true;
 volatile uint32_t pulse_count = 0;
 
-/* System Heartbeat (Timer 0) - Using CTC for 1ms ticks */
-ISR(TIMER0_COMPA_vect) {
+/* System Heartbeat (Now using Timer 2) - 1ms ticks */
+ISR(TIMER2_COMPA_vect) {
     ms_ticks++;
 }
 
@@ -98,42 +98,41 @@ void lcd_init(void) {
 
 /* Fan Control Logic */
 void fan_init(void) {
-    // Set PD5 as output
-    DDRD |= (1 << PD5);      
-    // Set PD3 as input with pull-up
-    DDRD &= ~(1 << PD3);     
-    PORTD |= (1 << PD3);    
-
-    // Timer 2: Fast PWM on OC2B (PD5), non-inverting mode
-    TCCR2A = (1 << COM2B1) | (1 << WGM21) | (1 << WGM20);
+    // 1. Configure Pin Directions
+    DDRD |= (1 << PD5);      // PWM Output (OC0B)
+    DDRD &= ~((1 << PD2) | (1 << PD3)); // Inputs: Button (PD2) and Tach (PD3)
     
-    // Initial hardware speed sync
-    if (fan_on) {
-        OCR2B = (uint8_t)((counter * 255) / 100);
-    } else {
-        OCR2B = 0;
-    }
+    // 2. Enable Pull-ups for Inputs (CRITICAL for "ON" Logic stability)
+    PORTD |= (1 << PD2) | (1 << PD3);    
 
-    // Start Timer 2 clock with prescaler 64 (~976 Hz)
-    TCCR2B = (1 << CS22); 
+    /* 3. Timer 0: Fast PWM on OC0B (PD5) 
+       Requirement: 80 kHz frequency. 
+       Frequency = F_CPU / (Prescaler * (1 + TOP))
+       For 80kHz: 16MHz / (1 * (1 + 199)) = 80,000 Hz
+       We use Mode 7 (Fast PWM with OCR0A as TOP) */
+    
+    TCCR0A = (1 << COM0B1) | (1 << WGM01) | (1 << WGM00); // Fast PWM, Non-inv OC0B
+    TCCR0B = (1 << WGM02) | (1 << CS00);                 // Mode 7, No Prescaling
+    
+    OCR0A = 199; // Sets frequency to 80 kHz
+    OCR0B = 0;   // Initialize duty cycle to 0
 }
 
 void update_fan_hardware(void) {
     if (!fan_on) {
-        OCR2B = 0;
+        OCR0B = 0;
     } else {
-        // Enforce bounds
+        // Enforce bounds 0-100%
         if (counter > 100) counter = 100;
         if (counter < 0)   counter = 0;
         
-        // Calculate 8-bit duty cycle (0-255)
+        // Calculate duty cycle based on TOP (OCR0A = 199)
+        // OCR0B = (Percentage / 100) * OCR0A
         if (counter == 0) {
-            OCR2B = 0;
+            OCR0B = 0;
         } else {
-            // Lab 4 Slide 8: Start duty cycle should be >= 25% for reliability
-            // We scale the counter to the full 0-255 range
-            uint16_t temp_ocr = (uint16_t)((counter * 255UL) / 100UL);
-            OCR2B = (uint8_t)temp_ocr;
+            uint16_t temp_ocr = (uint16_t)((counter * 199UL) / 100UL);
+            OCR0B = (uint8_t)temp_ocr;
         }
     }
 }
@@ -167,11 +166,11 @@ ISR(PCINT0_vect) { // RPG Rotation
 }
 
 int main(void) {
-    // 1. Initialize System Timer (Timer 0) for millis()
-    TCCR0A = (1 << WGM01); // CTC Mode
-    OCR0A  = 249;          // 1ms @ 16MHz/64
-    TCCR0B = (1 << CS01) | (1 << CS00); 
-    TIMSK0 = (1 << OCIE0A);
+    // 1. Initialize System Timer (Now using Timer 2) for millis()
+    TCCR2A = (1 << WGM21); // CTC Mode
+    OCR2A  = 249;          // 1ms @ 16MHz/64
+    TCCR2B = (1 << CS22);  // 64 prescaler
+    TIMSK2 = (1 << OCIE2A);
 
     // 2. Initialize Hardware Peripherals
     lcd_init();
@@ -204,7 +203,7 @@ int main(void) {
         if (!fan_on) {
             lcd_print("Fan:OFF    ");
         } else {
-            // Lab 4 Slide 8: Visual feedback for low power
+            // Visual feedback for start-up reliability
             if (counter < 25) lcd_print("Fan:LOW    ");
             else             lcd_print("Fan:ON     ");
         }
