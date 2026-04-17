@@ -9,242 +9,209 @@
 /* === PIN CONNECTIONS ===
 LCD:
 RS -> A0
-E -> A1
+E  -> A1
 D4 -> A2
 D5 -> A3
 D6 -> A4
 D7 -> A5
 
-PUSH BUTTON -> 2
-
-RPG:
-A -> ~9
-B -> 8
+PUSH BUTTON -> PD2 (INT0)
+RPG A       -> PB1 (Digital 9)
+RPG B       -> PB0 (Digital 8)
 
 FAN:
-Power -> VIN
-GND -> GND
-PWM -> ~5
-TACH -> ~3
+Power -> VIN (9V Wall Wart)
+GND   -> GND
+PWM   -> PD5 (OC2B / Digital 5)
+TACH  -> PD3 (INT1 / Digital 3)
+*/
 
-/* ================= DEBOUNCE ================= */
+/* ================= DEBOUNCE & GLOBAL STATE ================= */
 
 #define BTN_DEBOUNCE_MS 40
 #define RPG_DEBOUNCE_MS 2
 
 volatile uint32_t ms_ticks = 0;
+volatile int16_t counter = 50; // Start at 50%
+volatile bool fan_on = true;
 
 /* millisecond timer using Timer0 */
 ISR(TIMER0_COMPA_vect)
 {
-	ms_ticks++;
+    ms_ticks++;
 }
 
 uint32_t millis(void)
 {
-	uint32_t t;
-	cli();
-	t = ms_ticks;
-	sei();
-	return t;
+    uint32_t t;
+    cli();
+    t = ms_ticks;
+    sei();
+    return t;
 }
 
 /* ================= LCD LOW-LEVEL ================= */
 
 #define LCD_PORT PORTC
 #define LCD_DDR  DDRC
-
 #define LCD_RS PC0
 #define LCD_E  PC1
-#define LCD_D4 PC2
-#define LCD_D5 PC3
-#define LCD_D6 PC4
-#define LCD_D7 PC5
 
-void lcd_pulse_enable(void)
+void lcd_strobe(void)
 {
-	LCD_PORT |= (1 << LCD_E);
-	_delay_us(1);
-	LCD_PORT &= ~(1 << LCD_E);
-	_delay_us(100);
+    LCD_PORT |= (1 << LCD_E);
+    _delay_us(1);
+    LCD_PORT &= ~(1 << LCD_E);
+    _delay_us(100);
 }
 
-void lcd_send_nibble(uint8_t nibble)
+void lcd_write_nibble(uint8_t nibble, bool is_data)
 {
-	LCD_PORT &= ~((1<<LCD_D4)|(1<<LCD_D5)|(1<<LCD_D6)|(1<<LCD_D7));
-	if (nibble & 0x01) LCD_PORT |= (1 << LCD_D4);
-	if (nibble & 0x02) LCD_PORT |= (1 << LCD_D5);
-	if (nibble & 0x04) LCD_PORT |= (1 << LCD_D6);
-	if (nibble & 0x08) LCD_PORT |= (1 << LCD_D7);
-	lcd_pulse_enable();
+    // Clear pins PC2-PC5 (D4-D7)
+    LCD_PORT &= 0xC3; 
+    // Set data pins
+    LCD_PORT |= (nibble << 2);
+    
+    if (is_data) LCD_PORT |= (1 << LCD_RS);
+    else         LCD_PORT &= ~(1 << LCD_RS);
+    
+    lcd_strobe();
 }
 
-void lcd_cmd(uint8_t cmd)
+void lcd_command(uint8_t cmd)
 {
-	LCD_PORT &= ~(1 << LCD_RS);
-	lcd_send_nibble(cmd >> 4);
-	lcd_send_nibble(cmd & 0x0F);
-	_delay_ms(2);
+    lcd_write_nibble(cmd >> 4, false);
+    lcd_write_nibble(cmd & 0x0F, false);
+    _delay_ms(2);
 }
 
-void lcd_data(uint8_t data)
+void lcd_char(uint8_t data)
 {
-	LCD_PORT |= (1 << LCD_RS);
-	lcd_send_nibble(data >> 4);
-	lcd_send_nibble(data & 0x0F);
-	_delay_ms(2);
+    lcd_write_nibble(data >> 4, true);
+    lcd_write_nibble(data & 0x0F, true);
+}
+
+void lcd_print(const char* str)
+{
+    while (*str) lcd_char(*str++);
 }
 
 void lcd_init(void)
 {
-	LCD_DDR |= (1<<LCD_RS)|(1<<LCD_E)|(1<<LCD_D4)|(1<<LCD_D5)|(1<<LCD_D6)|(1<<LCD_D7);
-	_delay_ms(50);
-
-	lcd_send_nibble(0x03);
-	_delay_ms(5);
-	lcd_send_nibble(0x03);
-	_delay_us(150);
-	lcd_send_nibble(0x03);
-	lcd_send_nibble(0x02);
-
-	lcd_cmd(0x28);
-	lcd_cmd(0x0C);
-	lcd_cmd(0x06);
-	lcd_cmd(0x01);
+    LCD_DDR = 0xFF;
+    _delay_ms(50);
+    
+    // Manual 4-bit init sequence
+    lcd_write_nibble(0x03, false); _delay_ms(5);
+    lcd_write_nibble(0x03, false); _delay_us(200);
+    lcd_write_nibble(0x03, false);
+    lcd_write_nibble(0x02, false); 
+    
+    lcd_command(0x28); // 2 lines, 5x8
+    lcd_command(0x0C); // Display ON
+    lcd_command(0x01); // Clear
+    _delay_ms(2);
 }
 
-void lcd_clear(void)
+/* ================= FAN & INTERRUPTS ================= */
+
+void fan_init(void)
 {
-	lcd_cmd(0x01);
+    // PD5 as Output for PWM (OC2B)
+    DDRD |= (1 << PD5);
+    // PD3 as Input with Pull-up for Tachometer
+    DDRD &= ~(1 << PD3);
+    PORTD |= (1 << PD3);
+
+    // Timer 2 Setup for Fast PWM on OC2B (PD5)
+    // WGM21:0 = 3 (Fast PWM), COM2B1 = 1 (Non-inverting)
+    TCCR2A = (1 << COM2B1) | (1 << WGM21) | (1 << WGM20);
+    // Prescaler 64: 16MHz / 64 / 256 = ~976 Hz
+    TCCR2B = (1 << CS22); 
 }
 
-void lcd_goto(uint8_t col, uint8_t row)
+void update_fan_speed(void)
 {
-	lcd_cmd(0x80 + (row ? 0x40 : 0x00) + col);
+    if (!fan_on) {
+        OCR2B = 0;
+        return;
+    }
+    
+    // Clamp counter between 1 and 100 for duty cycle %
+    if (counter > 100) counter = 100;
+    if (counter < 1)   counter = 1;
+    
+    // Map 1-100% to 0-255 hardware register
+    OCR2B = (uint8_t)((counter * 255) / 100);
 }
 
-void lcd_print(const char *s)
+ISR(INT0_vect) // Pushbutton on PD2
 {
-	while (*s) lcd_data(*s++);
+    static uint32_t last_press = 0;
+    uint32_t now = millis();
+    if (now - last_press > BTN_DEBOUNCE_MS) {
+        fan_on = !fan_on;
+        last_press = now;
+    }
 }
 
-/* ================= GLOBAL STATE ================= */
-
-volatile int16_t counter = 0;
-volatile bool btn_event = false;
-volatile bool rpg_event = false;
-volatile bool rpg_cw = false;
-
-volatile uint32_t last_btn_time = 0;
-volatile uint32_t last_rpg_time = 0;
-
-/* ================= INTERRUPTS ================= */
-
-/* Pushbutton INT0 with debounce */
-ISR(INT0_vect)
+ISR(PCINT0_vect) // RPG on PB0/PB1
 {
-	uint32_t now = millis();
-	if (now - last_btn_time >= BTN_DEBOUNCE_MS)
-	{
-		btn_event = true;
-		last_btn_time = now;
-	}
+    static uint8_t last_state = 0;
+    uint8_t curr_state = (PINB & 0x03); 
+    
+    if (curr_state != last_state) {
+        // Simple state-based RPG logic
+        if (last_state == 0x02 && curr_state == 0x00) counter++;
+        if (last_state == 0x01 && curr_state == 0x00) counter--;
+        last_state = curr_state;
+    }
 }
 
-/* RPG: debounced + 1 count per detent */
-ISR(PCINT0_vect)
-{
-	static uint8_t last_state = 0;
-	uint8_t curr_state = PINB & 0x03;
-
-	uint32_t now = millis();
-	if (now - last_rpg_time < RPG_DEBOUNCE_MS)
-	return;
-
-	/* Count only at stable detent state (00) */
-	if (curr_state == 0x00 && last_state != 0x00)
-	{
-		if (last_state == 0x01)
-		{
-			counter++;
-			rpg_cw = true;
-			rpg_event = true;
-		}
-		else if (last_state == 0x02)
-		{
-			counter--;
-			rpg_cw = false;
-			rpg_event = true;
-		}
-
-		last_rpg_time = now;
-	}
-
-	last_state = curr_state;
-}
-
-/* ================= INIT ================= */
+/* ================= SYSTEM INIT ================= */
 
 void timer0_init(void)
 {
-	TCCR0A = (1 << WGM01);
-	OCR0A  = 249;                 // 1 ms at 16 MHz / 64
-	TCCR0B = (1 << CS01) | (1 << CS00);
-	TIMSK0 = (1 << OCIE0A);
+    TCCR0A = (1 << WGM01); // CTC
+    OCR0A  = 249;          // 1ms
+    TCCR0B = (1 << CS01) | (1 << CS00); // 64 prescaler
+    TIMSK0 = (1 << OCIE0A);
 }
 
-void pushbutton_init(void)
+void interrupts_init(void)
 {
-	DDRD &= ~(1 << PD2);
-	PORTD |= (1 << PD2);
-
-	EICRA |= (1 << ISC01);
-	EIMSK |= (1 << INT0);
+    // Button on INT0 (PD2)
+    EICRA |= (1 << ISC01); // Falling edge
+    EIMSK |= (1 << INT0);
+    
+    // RPG on PCINT0 (PB0, PB1)
+    PCICR |= (1 << PCIE0);
+    PCMSK0 |= (1 << PCINT0) | (1 << PCINT1);
+    
+    sei();
 }
-
-void rpg_init(void)
-{
-	DDRB &= ~((1<<PB0)|(1<<PB1));
-	PORTB |= (1<<PB0)|(1<<PB1);
-
-	PCICR |= (1 << PCIE0);
-	PCMSK0 |= (1 << PCINT0) | (1 << PCINT1);
-}
-
-/* ================= MAIN ================= */
 
 int main(void)
 {
-	char buf[17];
-
-	cli();
-	timer0_init();
-	lcd_init();
-	pushbutton_init();
-	rpg_init();
-	sei();
-
-	lcd_print("I/O Test Ready");
-
-	while (1)
-	{
-		if (btn_event)
-		{
-			lcd_clear();
-			lcd_print("Button Pressed");
-			btn_event = false;
-		}
-
-		if (rpg_event)
-		{
-			lcd_clear();
-			snprintf(buf, 16, "Counter: %d", counter);
-			lcd_print(buf);
-
-			lcd_goto(0,1);
-			lcd_print(rpg_cw ? "RPG: CW" : "RPG: CCW");
-
-			rpg_event = false;
-		}
-	}
+    timer0_init();
+    lcd_init();
+    fan_init();
+    interrupts_init();
+    
+    char buffer[16];
+    
+    while (1)
+    {
+        update_fan_speed();
+        
+        lcd_command(0x80); // Line 1
+        sprintf(buffer, "DC=%d.0%%  ", counter);
+        lcd_print(buffer);
+        
+        lcd_command(0xC0); // Line 2
+        if (fan_on) lcd_print("Fan:ON     ");
+        else        lcd_print("Fan:OFF    ");
+        
+        _delay_ms(50);
+    }
 }
