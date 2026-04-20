@@ -30,7 +30,9 @@ TACH  -> PD3 (INT1 / Digital 3)
 #define RPG_DEBOUNCE_MS 2
 
 volatile uint32_t ms_ticks = 0;
-volatile int16_t counter = 50; 
+// Counter now represents 0.5% units. 200 units = 100%. 
+// Initial value 100 = 50.0%
+volatile int16_t counter = 100; 
 volatile bool fan_on = true;
 volatile uint32_t pulse_count = 0;
 volatile uint32_t last_pulse_count = 0;
@@ -101,35 +103,31 @@ void lcd_init(void) {
 
 /* Fan Control Logic */
 void fan_init(void) {
-    // 1. Configure Pin Directions
     DDRD |= (1 << PD5);      // PWM Output (OC0B)
-    DDRD &= ~((1 << PD2) | (1 << PD3)); // Inputs: Button (PD2) and Tach (PD3)
-    
-    // 2. Enable Pull-ups for Inputs (CRITICAL for "ON" Logic stability)
+    DDRD &= ~((1 << PD2) | (1 << PD3)); // Inputs
     PORTD |= (1 << PD2) | (1 << PD3);    
 
-    /* 3. Timer 0: Fast PWM on OC0B (PD5) 
-       Requirement: 80 kHz frequency. 
-       Frequency = F_CPU / (Prescaler * (1 + TOP))
-       For 80kHz: 16MHz / (1 * (1 + 199)) = 80,000 Hz
-       We use Mode 7 (Fast PWM with OCR0A as TOP) */
+    // Timer 0: Fast PWM, TOP = OCR0A, Non-inv OC0B
+    // Mode 7, Frequency = 80 kHz
+    TCCR0A = (1 << COM0B1) | (1 << WGM01) | (1 << WGM00); 
+    TCCR0B = (1 << WGM02) | (1 << CS00);                 
     
-    TCCR0A = (1 << COM0B1) | (1 << WGM01) | (1 << WGM00); // Fast PWM, Non-inv OC0B
-    TCCR0B = (1 << WGM02) | (1 << CS00);                 // Mode 7, No Prescaling
-    
-    OCR0A = 199; // Sets frequency to 80 kHz
-    OCR0B = 0;   // Initialize duty cycle to 0
+    OCR0A = 199; 
+    OCR0B = 0;   
 }
 
 void update_fan_hardware(void) {
     if (!fan_on) {
         OCR0B = 0;
     } else {
-        // Enforce bounds 1-100%
-        if (counter > 100) counter = 100;
-        if (counter < 1)   counter = 1;
+        // Enforce bounds: 2 units (1.0%) to 200 units (100.0%)
+        // We use 2 as min because Lab requires DC between 1% and 100%
+        if (counter > 200) counter = 200;
+        if (counter < 2)   counter = 2;
         
-        uint16_t temp_ocr = (uint16_t)((counter * 199UL) / 100UL);
+        // Duty cycle calculation: (counter / 200) * OCR0A
+        // Using UL to avoid overflow
+        uint16_t temp_ocr = (uint16_t)((counter * 199UL) / 200UL);
         OCR0B = (uint8_t)temp_ocr;
     }
 }
@@ -152,7 +150,6 @@ ISR(PCINT0_vect) { // RPG Rotation
     static uint8_t last_state = 0;
     uint8_t curr_state = (PINB & 0x03); 
     
-    // Only adjust speed if fan is currently toggled ON
     if (fan_on && (curr_state != last_state)) {
         if (curr_state == 0x00) { // Stable detent
             if (last_state == 0x02)      counter++;
@@ -169,7 +166,6 @@ int main(void) {
     TCCR2B = (1 << CS22);  // 64 prescaler
     TIMSK2 = (1 << OCIE2A);
 
-    // 2. Initialize Hardware Peripherals
     lcd_init();
     fan_init();
 
@@ -182,30 +178,30 @@ int main(void) {
     PCICR  |= (1 << PCIE0); // Group 0
     PCMSK0 |= (1 << PCINT0) | (1 << PCINT1); // PB0, PB1
     
-    // 5. Enable Global Interrupts
     sei();
     
     char buffer[16];
     
     while (1) {
-        // Ensure hardware reflects software state
         update_fan_hardware();
-		uint32_t now = millis();
-		
-		if(now - last_time >= 1000){
-			uint32_t pulses = pulse_count - last_pulse_count;
-			last_pulse_count = pulse_count;
-			last_time = now;
-			rpm = pulses * 30;
-		}
-		
+        uint32_t now = millis();
         
-        // Refresh LCD UI
-        lcd_command(0x80); // Line 1
-        sprintf(buffer, "DC = %d.0%%   ", counter);
+        // RPM Calculation every 1 second
+        if(now - last_time >= 1000){
+            uint32_t pulses = pulse_count - last_pulse_count;
+            last_pulse_count = pulse_count;
+            last_time = now;
+            // 2 pulses per rev, so RPM = pulses * (60 / 2)
+            rpm = pulses * 30;
+        }
+        
+        // Display Duty Cycle with 0.5% precision
+        lcd_command(0x80); 
+        // counter/2 is the integer part, (counter%2)*5 is the decimal (.0 or .5)
+        sprintf(buffer, "DC = %d.%d%%    ", counter / 2, (counter % 2) * 5);
         lcd_print(buffer);
         
-        lcd_command(0xC0); // Line 2
+        lcd_command(0xC0); 
         if (!fan_on) {
 	        lcd_print("Fan: OFF     ");
 	        } else {
