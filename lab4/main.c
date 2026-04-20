@@ -33,6 +33,9 @@ volatile uint32_t ms_ticks = 0;
 volatile int16_t counter = 50; 
 volatile bool fan_on = true;
 volatile uint32_t pulse_count = 0;
+volatile uint32_t last_pulse_count = 0;
+volatile uint32_t last_time = 0;
+volatile uint16_t rpm = 0;
 
 /* System Heartbeat (Now using Timer 2) - 1ms ticks */
 ISR(TIMER2_COMPA_vect) {
@@ -122,18 +125,12 @@ void update_fan_hardware(void) {
     if (!fan_on) {
         OCR0B = 0;
     } else {
-        // Enforce bounds 0-100%
+        // Enforce bounds 1-100%
         if (counter > 100) counter = 100;
-        if (counter < 0)   counter = 0;
+        if (counter < 1)   counter = 1;
         
-        // Calculate duty cycle based on TOP (OCR0A = 199)
-        // OCR0B = (Percentage / 100) * OCR0A
-        if (counter == 0) {
-            OCR0B = 0;
-        } else {
-            uint16_t temp_ocr = (uint16_t)((counter * 199UL) / 100UL);
-            OCR0B = (uint8_t)temp_ocr;
-        }
+        uint16_t temp_ocr = (uint16_t)((counter * 199UL) / 100UL);
+        OCR0B = (uint8_t)temp_ocr;
     }
 }
 
@@ -193,19 +190,34 @@ int main(void) {
     while (1) {
         // Ensure hardware reflects software state
         update_fan_hardware();
+		uint32_t now = millis();
+		
+		if(now - last_time >= 1000){
+			uint32_t pulses = pulse_count - last_pulse_count;
+			last_pulse_count = pulse_count;
+			last_time = now;
+			rpm = pulses * 30;
+		}
+		
         
         // Refresh LCD UI
         lcd_command(0x80); // Line 1
-        sprintf(buffer, "DC=%d.0%%   ", counter);
+        sprintf(buffer, "DC = %d.0%%   ", counter);
         lcd_print(buffer);
         
         lcd_command(0xC0); // Line 2
         if (!fan_on) {
-            lcd_print("Fan:OFF    ");
-        } else {
-            // Visual feedback for start-up reliability
-            if (counter < 25) lcd_print("Fan:LOW    ");
-            else             lcd_print("Fan:ON     ");
+	        lcd_print("Fan: OFF     ");
+	        } else {
+	        if (rpm == 0) {
+		        lcd_print("Fan: stopped "); 
+	        }
+	        else if (rpm < 2640) {
+		        lcd_print("Fan: low RPM "); 
+	        }
+	        else {
+		        lcd_print("Fan: RPM OK  "); 
+	        }
         }
         
         _delay_ms(50); // Refresh rate
