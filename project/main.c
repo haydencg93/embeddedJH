@@ -169,7 +169,7 @@ int main(void) {
 		// ----- READ POT (ONLY WHEN SYSTEM ON) -----
 		if (systemOn) {
 			uint16_t pot = adc_read();
-			thresholdF = 60 + (pot * 40UL / 1023);
+			thresholdF = 50 + (pot * 40UL / 1023);
 		}
 
 		// ----- DISPLAY -----
